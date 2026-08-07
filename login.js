@@ -40,6 +40,8 @@ function log(msg) {
   console.log(`[${new Date().toISOString()}] ${msg}`);
 }
 
+class FatalCaptchaError extends Error {}
+
 async function waitForChallenge(page, getChallenge) {
   for (let i = 0; i < 30; i++) {
     const c = getChallenge();
@@ -71,15 +73,18 @@ async function solveGate(page, getGateStart) {
   }
 
   await page.mouse.move(cx, cy);
+  // human-like delay before pressing the finger down
+  await sleep(300 + Math.floor(Math.random() * 700));
   await page.mouse.down();
   // small human-like micro movements so the server sees "moves"
+  const hold = holdMs + 150 + Math.floor(Math.random() * 200);
   for (let i = 0; i < 4; i++) {
-    await sleep(holdMs / 4);
+    await sleep(hold / 4);
     await page.mouse.move(cx + (Math.random() - 0.5) * 6, cy + (Math.random() - 0.5) * 6);
   }
-  await sleep(150);
+  await sleep(80 + Math.floor(Math.random() * 120));
   await page.mouse.up();
-  log(`  gate: held ~${holdMs + 150}ms`);
+  log(`  gate: held ~${hold}ms`);
 }
 
 // ---- Type slide: drag handle to the glowing zone (target_pct) ----
@@ -262,11 +267,13 @@ async function solveCaptcha(page, options = {}) {
     try {
       if (id === 'scGateWrap') {
         gateLoops++;
-        if (gateLoops > 6) {
-          throw new Error('Too many consecutive gate challenges - likely IP-flagged.');
+        if (gateLoops > 4) {
+          // Consecutive gate challenges mean the server doesn't trust this IP.
+          // Don't waste retries on it - the round will rotate to a fresh IP.
+          throw new FatalCaptchaError('Too many consecutive gate challenges (likely a flagged IP).');
         }
         await solveGate(page, () => gateStart);
-        await sleep(400); // server refetches the real challenge
+        await sleep(600 + Math.floor(Math.random() * 600)); // server refetches the real challenge
         continue;
       }
       gateLoops = 0;
@@ -279,7 +286,7 @@ async function solveCaptcha(page, options = {}) {
     } catch (e) {
       // Transient widget errors (e.g. a gate button that never rendered) are
       // retried against a fresh challenge instead of aborting the whole captcha.
-      if (e.message === 'Temporarily blocked by captcha system') throw e;
+      if (e instanceof FatalCaptchaError || e.message === 'Temporarily blocked by captcha system') throw e;
       log(`  solve error (attempt ${attempt + 1}): ${e.message} - retrying with a fresh challenge`);
       await sleep(1500);
       continue;
@@ -500,14 +507,46 @@ async function run() {
   if (!CONFIG.email || !CONFIG.password) {
     throw new Error('ARUBLE_EMAIL / ARUBLE_PASSWORD environment variables are not set.');
   }
-  // A fresh browser each round forces new proxy connections, so the rotating
-  // residential proxy hands out a fresh exit IP per round. The site flags an
-  // IP after ~1 claim, so rotating per round is what keeps claims working.
+  // The site flags an IP after ~1 claim, so the rotating residential proxy must
+  // hand out a fresh exit IP per attempt. A fresh browser each attempt forces
+  // new proxy connections -> new IP.
+  const maxIpTries = parseInt(process.env.MAX_IP_TRIES || '4', 10);
   let consecutiveFailures = 0;
   let round = 0;
   while (round < CONFIG.maxRounds) {
     round++;
     log(`--- Round ${round} ---`);
+    let outcome;
+    try {
+      outcome = await runRound(maxIpTries);
+    } catch (err) {
+      log(`Round ${round} error: ${err.message}`);
+      outcome = 'failed';
+    }
+    log(`Round ${round} outcome: ${outcome}`);
+    if (outcome === 'failed') {
+      consecutiveFailures++;
+      if (consecutiveFailures >= 6) {
+        log('6 consecutive failed rounds - aborting.');
+        break;
+      }
+    } else {
+      consecutiveFailures = 0;
+    }
+
+    if (round >= CONFIG.maxRounds) break;
+
+    // 3. Wait a random 6-7 minutes before the next claim
+    const waitSec = CONFIG.claimWaitMin + Math.floor(Math.random() * (CONFIG.claimWaitMax - CONFIG.claimWaitMin + 1));
+    log(`Waiting ${waitSec}s (${(waitSec / 60).toFixed(2)} min) before next claim...`);
+    await sleep(waitSec * 1000);
+  }
+  log('Bot finished.');
+}
+
+async function runRound(maxIpTries) {
+  for (let ipTry = 1; ipTry <= maxIpTries; ipTry++) {
+    if (ipTry > 1) log(`Fresh proxy IP attempt (${ipTry}/${maxIpTries})...`);
     const { browser, page, saveSession } = await startBrowser();
     try {
       // 1. Reach the faucet, reusing the existing session when possible.
@@ -526,33 +565,26 @@ async function run() {
       log(`Faucet: timer=${timer}, reward=${reward}, balance=${balance}`);
 
       // 2. Claim if the faucet is ready
-      if (await isFaucetReady(page)) {
-        await claimFaucet(page);
-      } else {
-        log(`Faucet on cooldown (timer=${timer}), skipping claim this round.`);
+      if (!(await isFaucetReady(page))) {
+        log(`Faucet on cooldown (timer=${timer}), skipping this round.`);
+        await saveSession();
+        return 'cooldown';
       }
+
+      const res = await claimFaucet(page);
       await saveSession();
-      consecutiveFailures = 0;
+      if (res === 'claimed') return 'claimed';
+      // Claim failed (flagged IP / captcha) -> try the next proxy IP.
+      if (ipTry < maxIpTries) await sleep(2500);
     } catch (err) {
-      log(`Round ${round} error: ${err.message}`);
-      await page.screenshot({ path: `error_round${round}.png`, fullPage: true }).catch(() => {});
-      consecutiveFailures++;
-      if (consecutiveFailures >= 6) {
-        log('6 consecutive failed rounds - aborting.');
-        throw new Error('Aborting after 6 consecutive failed rounds');
-      }
+      log(`IP attempt ${ipTry} failed: ${err.message}`);
+      await page.screenshot({ path: 'error.png', fullPage: true }).catch(() => {});
+      if (ipTry < maxIpTries) await sleep(2500);
     } finally {
       await browser.close();
     }
-
-    if (round >= CONFIG.maxRounds) break;
-
-    // 3. Wait a random 6-7 minutes before the next claim
-    const waitSec = CONFIG.claimWaitMin + Math.floor(Math.random() * (CONFIG.claimWaitMax - CONFIG.claimWaitMin + 1));
-    log(`Waiting ${waitSec}s (${(waitSec / 60).toFixed(2)} min) before next claim...`);
-    await sleep(waitSec * 1000);
   }
-  log('Bot finished.');
+  return 'failed';
 }
 
 // ---- Faucet claim ----
@@ -587,54 +619,28 @@ async function claimFaucet(page) {
   const disabled = await page.locator('#claimBtn').isDisabled().catch(() => true);
   if (disabled || !/claim now/i.test(btnText)) {
     log(`Faucet on cooldown (button: "${btnText}"), skipping claim.`);
-    return;
+    return 'cooldown';
   }
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    log(`Claiming faucet reward (attempt ${attempt}/3)...`);
-    let result;
-    try {
-      result = await attemptClaim(page);
-    } catch (e) {
-      // Flagged IPs gate-loop in the captcha; the next round gets a fresh IP.
-      log(`Claim captcha failed (${e.message}) - skipping claim this round.`);
-      return;
-    }
-
-    if (result && result.success) {
-      log(`Claim SUCCESS: +${result.amount} ${result.symbol} -> balance ${result.balance_after}`);
-      return;
-    }
-
-    const msg = (result && result.message) || 'no server response';
-    log(`Claim attempt ${attempt} failed: ${msg}`);
-
-    // The site's fraud check rejects sessions whose IP looks like a VPN/proxy.
-    // Re-logging in gets a fresh session, which sometimes clears the flag.
-    if (!/vpn|proxy|detected/i.test(msg)) {
-      log('Non-retryable claim error, giving up this round.');
-      return;
-    }
-    if (attempt === 3) {
-      log('Still VPN/proxy blocked after 3 attempts - giving up this round.');
-      return;
-    }
-
-    log('VPN/proxy detected - re-logging in to get a fresh session...');
-    try {
-      await ensureLoggedIn(page);
-      if (!(await reachFaucet(page))) throw new Error('Could not reach faucet after re-login');
-      await dismissInterstitial(page);
-      const ready = await isFaucetReady(page);
-      if (!ready) {
-        log('Faucet on cooldown after re-login, skipping claim this round.');
-        return;
-      }
-    } catch (e) {
-      log(`Re-login after VPN block failed: ${e.message} - skipping claim this round.`);
-      return;
-    }
+  log('Claiming faucet reward...');
+  let result;
+  try {
+    result = await attemptClaim(page);
+  } catch (e) {
+    // Flagged IPs gate-loop in the captcha. Re-logging in on the same IP is
+    // useless - the round will rotate to a fresh proxy IP instead.
+    log(`Claim captcha failed (${e.message}) - rotating to a fresh IP.`);
+    return 'failed';
   }
+
+  if (result && result.success) {
+    log(`Claim SUCCESS: +${result.amount} ${result.symbol} -> balance ${result.balance_after}`);
+    return 'claimed';
+  }
+
+  const msg = (result && result.message) || 'no server response';
+  log(`Claim failed: ${msg} - rotating to a fresh IP.`);
+  return 'failed';
 }
 
 module.exports = { CONFIG, solveCaptcha, sleep };
