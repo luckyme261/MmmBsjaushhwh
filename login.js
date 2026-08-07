@@ -38,6 +38,11 @@ async function waitForChallenge(page, getChallenge) {
 // ---- Human gate: press & hold the fingerprint button until ring fills ----
 async function solveGate(page, getGateStart) {
   const btn = page.locator('#scGateBtn');
+  try {
+    await btn.waitFor({ state: 'visible', timeout: 6000 });
+  } catch (e) {
+    throw new Error('Gate button not visible');
+  }
   await btn.scrollIntoViewIfNeeded().catch(() => {});
   const box = await btn.boundingBox();
   if (!box) throw new Error('Gate button not visible');
@@ -210,7 +215,7 @@ async function solveCaptcha(page, options = {}) {
 
   let solved = false;
   const wrapSel = '#scGateWrap:visible, #scSlideWrap:visible, #scOrderWrap:visible, #scLeastWrap:visible, #scDotWrap:visible, #scBanWrap:visible';
-  for (let attempt = 0; attempt < 10; attempt++) {
+  for (let attempt = 0; attempt < 15; attempt++) {
     // Wait up to ~60s for a challenge widget, tolerating the loading state / slow responses
     let id = null;
     for (let w = 0; w < 60; w++) {
@@ -239,17 +244,26 @@ async function solveCaptcha(page, options = {}) {
       throw new Error('Temporarily blocked by captcha system');
     }
 
-    if (id === 'scGateWrap') {
-      await solveGate(page, () => gateStart);
-      await sleep(400); // server refetches the real challenge
+    try {
+      if (id === 'scGateWrap') {
+        await solveGate(page, () => gateStart);
+        await sleep(400); // server refetches the real challenge
+        continue;
+      }
+
+      const data = await waitForChallenge(page, () => challenge);
+      if (id === 'scSlideWrap') await solveSlide(page, data.target_pct);
+      else if (id === 'scOrderWrap') await solveOrder(page, data);
+      else if (id === 'scLeastWrap') await solveLeast(page, data);
+      else if (id === 'scDotWrap') await solveDot(page, data.target_x, data.target_y);
+    } catch (e) {
+      // Transient widget errors (e.g. a gate button that never rendered) are
+      // retried against a fresh challenge instead of aborting the whole captcha.
+      if (e.message === 'Temporarily blocked by captcha system') throw e;
+      log(`  solve error (attempt ${attempt + 1}): ${e.message} - retrying with a fresh challenge`);
+      await sleep(1500);
       continue;
     }
-
-    const data = await waitForChallenge(page, () => challenge);
-    if (id === 'scSlideWrap') await solveSlide(page, data.target_pct);
-    else if (id === 'scOrderWrap') await solveOrder(page, data);
-    else if (id === 'scLeastWrap') await solveLeast(page, data);
-    else if (id === 'scDotWrap') await solveDot(page, data.target_x, data.target_y);
 
     // Wait for the outcome
     for (let i = 0; i < 40; i++) {
