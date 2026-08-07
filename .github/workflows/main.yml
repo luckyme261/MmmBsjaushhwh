@@ -1,0 +1,40 @@
+name: Aruble Faucet Bot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+  schedule:
+    # Every 6 hours. Each run lasts ~5h, so runs do not overlap
+    # (prevents duplicate claims while the faucet is on cooldown).
+    - cron: '0 */6 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      ARUBLE_EMAIL: ${{ secrets.ARUBLE_EMAIL }}
+      ARUBLE_PASSWORD: ${{ secrets.ARUBLE_PASSWORD }}
+      PROXY_URL: ${{ secrets.PROXY_URL }}
+      # 40 rounds x ~6.5 min ~= 260 min, finishing before the job timeout.
+      MAX_ROUNDS: '40'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the faucet bot
+        run: node login.js

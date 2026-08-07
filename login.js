@@ -1,0 +1,442 @@
+const { chromium } = require('playwright');
+const fs = require('fs');
+
+const STORAGE_STATE = 'session.json';
+
+const CONFIG = {
+  site: 'https://aruble.net',
+  // Credentials can come from env vars (ARUBLE_EMAIL / ARUBLE_PASSWORD),
+  // falling back to the values baked into the config below.
+  email: process.env.ARUBLE_EMAIL || 'francisdominic261@gmail.com',
+  password: process.env.ARUBLE_PASSWORD || 'Frank986532',
+  headless: true,
+  // Random wait between claims (seconds). 6-7 minutes by default.
+  // Override with CLAIM_WAIT_MIN / CLAIM_WAIT_MAX env vars.
+  claimWaitMin: parseInt(process.env.CLAIM_WAIT_MIN || '360', 10),
+  claimWaitMax: parseInt(process.env.CLAIM_WAIT_MAX || '420', 10),
+  // Optional residential proxy, e.g. PROXY_URL=http://user:pass@host:port
+  // Needed because the claim endpoint rejects datacenter/VPN IPs.
+  proxy: process.env.PROXY_URL || null,
+  // For testing; set MAX_ROUNDS=n env to limit loop iterations.
+  maxRounds: parseInt(process.env.MAX_ROUNDS || '0', 10) || Infinity,
+};
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+async function waitForChallenge(page, getChallenge) {
+  for (let i = 0; i < 30; i++) {
+    const c = getChallenge();
+    if (c && c.type) return c;
+    await sleep(150);
+  }
+  throw new Error('No challenge data captured from /captcha/challenge');
+}
+
+// ---- Human gate: press & hold the fingerprint button until ring fills ----
+async function solveGate(page, getGateStart) {
+  const btn = page.locator('#scGateBtn');
+  await btn.scrollIntoViewIfNeeded().catch(() => {});
+  const box = await btn.boundingBox();
+  if (!box) throw new Error('Gate button not visible');
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+
+  let holdMs = 1000;
+  for (let i = 0; i < 20; i++) {
+    const g = getGateStart();
+    if (g && g.hold_ms) { holdMs = g.hold_ms; break; }
+    await sleep(100);
+  }
+
+  await page.mouse.move(cx, cy);
+  await page.mouse.down();
+  // small human-like micro movements so the server sees "moves"
+  for (let i = 0; i < 4; i++) {
+    await sleep(holdMs / 4);
+    await page.mouse.move(cx + (Math.random() - 0.5) * 6, cy + (Math.random() - 0.5) * 6);
+  }
+  await sleep(150);
+  await page.mouse.up();
+  log(`  gate: held ~${holdMs + 150}ms`);
+}
+
+// ---- Type slide: drag handle to the glowing zone (target_pct) ----
+async function solveSlide(page, targetPct) {
+  const track = page.locator('#scTrack');
+  const handle = page.locator('#scHandle');
+  await handle.scrollIntoViewIfNeeded().catch(() => {});
+  const tb = await track.boundingBox();
+  const hb = await handle.boundingBox();
+  if (!tb || !hb) throw new Error('Slide elements not visible');
+
+  const usable = tb.width - hb.width;
+  const targetX = tb.x + hb.width / 2 + usable * (targetPct / 100);
+  const startX = hb.x + hb.width / 2;
+  const startY = hb.y + hb.height / 2;
+
+  await page.mouse.move(startX, startY);
+  await page.mouse.down();
+  const steps = 30;
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    await page.mouse.move(startX + (targetX - startX) * ease, startY, { steps: 3 });
+    await sleep(12);
+  }
+  await sleep(80);
+  await page.mouse.up();
+  log(`  slide: dragged to ${targetPct}%`);
+}
+
+// ---- Type drag_dot: drag the dot into the circle ----
+async function solveDot(page, targetX, targetY) {
+  const area = page.locator('#scDotArea');
+  const dot = page.locator('#scDot');
+  await dot.scrollIntoViewIfNeeded().catch(() => {});
+  const ab = await area.boundingBox();
+  const db = await dot.boundingBox();
+  if (!ab || !db) throw new Error('Dot elements not visible');
+
+  const startX = db.x + db.width / 2;
+  const startY = db.y + db.height / 2;
+  const endX = ab.x + ab.width * (targetX / 100);
+  const endY = ab.y + ab.height * (targetY / 100);
+
+  await page.mouse.move(startX, startY);
+  await page.mouse.down();
+  const steps = 25;
+  for (let i = 1; i <= steps; i++) {
+    const t = i / steps;
+    await page.mouse.move(startX + (endX - startX) * t, startY + (endY - startY) * t, { steps: 3 });
+    await sleep(10);
+  }
+  await sleep(100);
+  await page.mouse.up();
+  log(`  dot: dragged to ${targetX}%, ${targetY}%`);
+}
+
+// ---- Type icon_order: click the emoji cells in the shown sequence ----
+async function solveOrder(page, data) {
+  const prompt = data.prompt || [];
+  const display = data.display || [];
+  log(`  order: prompt = ${JSON.stringify(prompt)}`);
+  const cells = page.locator('#scOrderGrid .sc-icon-cell');
+  const used = new Set();
+  for (const emoji of prompt) {
+    let clicked = false;
+    for (let i = 0; i < display.length; i++) {
+      if (used.has(i)) continue;
+      if (String(display[i].icon).trim() !== String(emoji).trim()) continue;
+      const cell = cells.nth(i);
+      await cell.scrollIntoViewIfNeeded().catch(() => {});
+      const box = await cell.boundingBox();
+      if (!box) continue;
+      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+      used.add(i);
+      clicked = true;
+      await sleep(220);
+      break;
+    }
+    if (!clicked) throw new Error('Could not find grid cell for prompt icon: ' + emoji);
+  }
+  log('  order: clicked sequence done');
+}
+
+// ---- Type least_repeat: click the rarest emoji ----
+async function solveLeast(page, data) {
+  const grid = data.grid || [];
+  const counts = {};
+  for (const item of grid) counts[item.icon] = (counts[item.icon] || 0) + 1;
+  let rarest = null;
+  let rarestCount = Infinity;
+  for (const icon of Object.keys(counts)) {
+    if (counts[icon] < rarestCount) { rarestCount = counts[icon]; rarest = icon; }
+  }
+  log(`  least: counts = ${JSON.stringify(counts)}, rarest = ${rarest}`);
+  const cells = page.locator('#scLeastGrid .sc-icon-cell');
+  for (let i = 0; i < grid.length; i++) {
+    if (String(grid[i].icon).trim() !== String(rarest).trim()) continue;
+    const cell = cells.nth(i);
+    await cell.scrollIntoViewIfNeeded().catch(() => {});
+    const box = await cell.boundingBox();
+    if (!box) continue;
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+    return;
+  }
+  throw new Error('Could not find rarest cell');
+}
+
+// ---- Main captcha solver loop ----
+async function solveCaptcha(page, options = {}) {
+  const { openBy = null, isVerified = null } = options;
+  let challenge = null;
+  let gateStart = null;
+
+  const onResponse = async (resp) => {
+    try {
+      const url = resp.url();
+      if (url.includes('/captcha/challenge')) {
+        const j = await resp.json();
+        challenge = j;
+      } else if (url.includes('/captcha/gate/start')) {
+        const j = await resp.json();
+        gateStart = j;
+      }
+    } catch (e) { /* ignore */ }
+  };
+  page.on('response', onResponse);
+
+  if (openBy) {
+    // Invoke the widget's own handler directly. A physical click is avoided
+    // because Playwright can re-dispatch it after the login modal hides, and the
+    // stray click lands on the captcha overlay which the site treats as "click
+    // outside to close".
+    let modalOpened = false;
+    for (let i = 0; i < 5 && !modalOpened; i++) {
+      await page.evaluate(openBy).catch(() => {});
+      try {
+        await page.waitForSelector('#slideCaptchaModal.open', { timeout: 5000 });
+        modalOpened = true;
+      } catch (e) {
+        await sleep(800);
+      }
+    }
+    if (!modalOpened) throw new Error('Could not open the captcha widget');
+  }
+  log('Opened captcha widget');
+
+  let solved = false;
+  const wrapSel = '#scGateWrap:visible, #scSlideWrap:visible, #scOrderWrap:visible, #scLeastWrap:visible, #scDotWrap:visible, #scBanWrap:visible';
+  for (let attempt = 0; attempt < 10; attempt++) {
+    // Wait up to ~60s for a challenge widget, tolerating the loading state / slow responses
+    let id = null;
+    for (let w = 0; w < 60; w++) {
+      const loc = page.locator(wrapSel);
+      const count = await loc.count().catch(() => 0);
+      if (count > 0) { id = await loc.first().getAttribute('id'); break; }
+      const modalOpen = await page.locator('#slideCaptchaModal.open').count().catch(() => 0);
+      if (modalOpen === 0) {
+        const loading = await page.locator('#scLoading.active').count().catch(() => 0);
+        const status = await page.locator('#scStatus').innerText().catch(() => '');
+        const subtitle = await page.locator('#scSubtitle').innerText().catch(() => '');
+        throw new Error(
+          `Captcha modal closed before a challenge appeared (loading=${loading}, subtitle="${subtitle}", status="${status}")`
+        );
+      }
+      await sleep(1000);
+    }
+    if (!id) {
+      const status = await page.locator('#scStatus').innerText().catch(() => '');
+      const subtitle = await page.locator('#scSubtitle').innerText().catch(() => '');
+      throw new Error(`No captcha widget appeared (subtitle="${subtitle}", status="${status}")`);
+    }
+    log(`  attempt ${attempt + 1}: widget = ${id}`);
+
+    if (id === 'scBanWrap') {
+      throw new Error('Temporarily blocked by captcha system');
+    }
+
+    if (id === 'scGateWrap') {
+      await solveGate(page, () => gateStart);
+      await sleep(400); // server refetches the real challenge
+      continue;
+    }
+
+    const data = await waitForChallenge(page, () => challenge);
+    if (id === 'scSlideWrap') await solveSlide(page, data.target_pct);
+    else if (id === 'scOrderWrap') await solveOrder(page, data);
+    else if (id === 'scLeastWrap') await solveLeast(page, data);
+    else if (id === 'scDotWrap') await solveDot(page, data.target_x, data.target_y);
+
+    // Wait for the outcome
+    for (let i = 0; i < 40; i++) {
+      if (isVerified) {
+        if (await isVerified()) { solved = true; break; }
+      } else {
+        const verified = await page.locator('#loginCaptchaStatus.captcha-verified').count();
+        if (verified > 0) { solved = true; break; }
+      }
+      const banVisible = await page.locator('#scBanWrap:visible').count();
+      if (banVisible > 0) throw new Error('Temporarily blocked by captcha system');
+      // still open with status "Verifying…" or a new challenge -> keep polling
+      await sleep(400);
+    }
+    if (solved) break;
+    log('  answer was rejected, retrying with a fresh challenge');
+  }
+
+  page.off('response', onResponse);
+
+  if (!solved) {
+    const status = await page.locator('#scStatus').innerText().catch(() => '');
+    throw new Error('Captcha could not be solved. Status: ' + status);
+  }
+  log('Captcha verified!');
+}
+// ---- Session / navigation helpers ----
+async function gotoFaucet(page) {
+  await page.goto(CONFIG.site + '/faucet', { waitUntil: 'domcontentloaded', timeout: 60000 });
+  try {
+    await page.waitForSelector('#claimCard', { timeout: 20000 });
+    return true; // logged in and on the faucet
+  } catch (e) {
+    return false; // likely logged out or session expired
+  }
+}
+
+async function dismissInterstitial(page) {
+  try {
+    await page.waitForSelector('#interstitialSkip:not([disabled])', { timeout: 8000 });
+    await page.click('#interstitialSkip');
+    log('Closed interstitial ad');
+  } catch (e) { /* no interstitial */ }
+  await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+}
+
+async function isFaucetReady(page) {
+  const text = await page.locator('#claimBtnText').innerText().catch(() => '');
+  const disabled = await page.locator('#claimBtn').isDisabled().catch(() => true);
+  return !disabled && /claim now/i.test(text);
+}
+
+async function ensureLoggedIn(page) {
+  log('Session expired - logging in...');
+  await page.goto(CONFIG.site, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+  // Wait for the page to settle (also covers Cloudflare interstitials)
+  await page.waitForSelector('button.btn-auth-login', { timeout: 90000 });
+
+  log('Clicking Sign in...');
+  await page.click('button.btn-auth-login');
+  await page.waitForSelector('#loginModal.show', { timeout: 10000 });
+
+  log('Filling credentials...');
+  await page.fill('#loginForm input[name="email"]', CONFIG.email);
+  await page.fill('#loginForm input[name="password"]', CONFIG.password);
+
+  log('Starting captcha...');
+  await solveCaptcha(page, { openBy: 'openAuthCaptcha("login")' });
+
+  log('Clicking Login...');
+  await page.click('#loginBtn');
+
+  // Login success redirects away from the homepage; wait for it.
+  await page.waitForTimeout(1500);
+  await page.waitForURL((url) => url.toString() !== CONFIG.site + '/', { timeout: 20000 }).catch(() => {});
+  await page.waitForLoadState('domcontentloaded').catch(() => {});
+  log('Logged in.');
+}
+
+async function run() {
+  const browser = await chromium.launch({
+    headless: CONFIG.headless,
+    args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
+  });
+  const contextOptions = {
+    viewport: { width: 1366, height: 850 },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    locale: 'en-US',
+    timezoneId: 'America/New_York',
+  };
+  if (CONFIG.proxy) contextOptions.proxy = { server: CONFIG.proxy };
+  if (fs.existsSync(STORAGE_STATE)) contextOptions.storageState = STORAGE_STATE;
+  const context = await browser.newContext(contextOptions);
+  const saveSession = () => context.storageState({ path: STORAGE_STATE }).catch(() => {});
+  await context.addInitScript(() => {
+    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+  });
+  const page = await context.newPage();
+
+  try {
+    let round = 0;
+    while (round < CONFIG.maxRounds) {
+      round++;
+      log(`--- Round ${round} ---`);
+
+      // 1. Reach the faucet, reusing the existing session when possible.
+      let onFaucet = await gotoFaucet(page);
+      if (!onFaucet) {
+        await ensureLoggedIn(page);
+        await saveSession();
+        onFaucet = await gotoFaucet(page);
+        if (!onFaucet) throw new Error('Could not reach faucet after login');
+      }
+      await dismissInterstitial(page);
+
+      const reward = await page.locator('.claim-reward-value').first().innerText().catch(() => '');
+      const balance = await page.locator('#cityBalAmount').first().innerText().catch(() => '');
+      const timer = await page.locator('#timerDigits').first().innerText().catch(() => '');
+      log(`Faucet: timer=${timer}, reward=${reward}, balance=${balance}`);
+
+      // 2. Claim if the faucet is ready
+      if (await isFaucetReady(page)) {
+        await claimFaucet(page);
+      } else {
+        log(`Faucet on cooldown (timer=${timer}), skipping claim this round.`);
+      }
+
+      if (round >= CONFIG.maxRounds) break;
+
+      // 3. Wait a random 6-7 minutes before the next claim
+      const waitSec = CONFIG.claimWaitMin + Math.floor(Math.random() * (CONFIG.claimWaitMax - CONFIG.claimWaitMin + 1));
+      log(`Waiting ${waitSec}s (${(waitSec / 60).toFixed(2)} min) before next claim...`);
+      await sleep(waitSec * 1000);
+    }
+    log('Bot finished.');
+  } catch (err) {
+    log('ERROR: ' + err.message);
+    await page.screenshot({ path: 'error.png', fullPage: true }).catch(() => {});
+    process.exitCode = 1;
+  } finally {
+    await browser.close();
+  }
+}
+
+// ---- Faucet claim ----
+async function claimFaucet(page) {
+  const btnText = await page.locator('#claimBtnText').innerText().catch(() => '');
+  const disabled = await page.locator('#claimBtn').isDisabled().catch(() => true);
+  if (disabled || !/claim now/i.test(btnText)) {
+    log(`Faucet on cooldown (button: "${btnText}"), skipping claim.`);
+    return;
+  }
+
+  log('Claiming faucet reward...');
+  let claimResult = null;
+  const onResp = async (resp) => {
+    try {
+      if (resp.url().includes('/faucet/claim')) {
+        claimResult = await resp.json();
+      }
+    } catch (e) { /* ignore */ }
+  };
+  page.on('response', onResp);
+
+  try {
+    await solveCaptcha(page, {
+      openBy: 'openCaptchaForClaim()',
+      isVerified: async () => claimResult !== null,
+    });
+
+    // Wait for the claim POST to settle (success or cooldown error)
+    for (let i = 0; i < 50; i++) {
+      if (claimResult) break;
+      await sleep(400);
+    }
+    if (claimResult && claimResult.success) {
+      log(`Claim SUCCESS: +${claimResult.amount} ${claimResult.symbol} -> balance ${claimResult.balance_after}`);
+    } else {
+      log(`Claim failed: ${(claimResult && claimResult.message) || 'no server response'}`);
+    }
+  } finally {
+    page.off('response', onResp);
+  }
+}
+
+module.exports = { CONFIG, solveCaptcha, sleep };
+
+if (require.main === module) run();
