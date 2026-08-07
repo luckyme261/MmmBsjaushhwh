@@ -311,7 +311,23 @@ async function reachFaucet(page, maxAttempts = 3) {
     if (await gotoFaucet(page)) return true;
     await sleep(5000);
   }
+  await dumpState(page, 'faucet_debug');
   return false;
+}
+
+async function dumpState(page, tag) {
+  try {
+    const s = await page.evaluate(() => ({
+      url: location.href,
+      title: document.title,
+      body: (document.body ? document.body.innerText : '').slice(0, 300).replace(/\n/g, ' | '),
+      claimCard: !!document.querySelector('#claimCard'),
+      botCheck: !!document.querySelector('#interstitialSkip'),
+    }));
+    log(`[${tag}] url=${s.url} title="${s.title}" claimCard=${s.claimCard} botCheck=${s.botCheck}`);
+    log(`[${tag}] body: ${s.body}`);
+  } catch (e) { log(`[${tag}] evaluate failed: ${e.message}`); }
+  await page.screenshot({ path: tag + '.png', fullPage: true }).catch(() => {});
 }
 
 async function dismissInterstitial(page) {
