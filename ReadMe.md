@@ -23,6 +23,9 @@ in a loop with a random 6-7 minute wait between claims.
 - **Auto re-login on VPN/proxy block** - if `/faucet/claim` responds with
   `VPN or proxy detected`, the bot re-logs in (fresh session) and retries the
   claim up to 3 times before giving up that round.
+- **Bot-check solving** - the site's `/faucet` route can redirect to its
+  `/bot-check` security page (math question + SlideCaptcha + integrity checks).
+  The bot solves it automatically and continues to the faucet.
 - **Proxy support** - required if the network IP is flagged as VPN/datacenter,
   because the claim endpoint rejects those IPs.
 

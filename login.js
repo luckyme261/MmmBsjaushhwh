@@ -214,6 +214,7 @@ async function solveCaptcha(page, options = {}) {
   log('Opened captcha widget');
 
   let solved = false;
+  let gateLoops = 0;
   const wrapSel = '#scGateWrap:visible, #scSlideWrap:visible, #scOrderWrap:visible, #scLeastWrap:visible, #scDotWrap:visible, #scBanWrap:visible';
   for (let attempt = 0; attempt < 15; attempt++) {
     // Wait up to ~60s for a challenge widget, tolerating the loading state / slow responses
@@ -246,10 +247,15 @@ async function solveCaptcha(page, options = {}) {
 
     try {
       if (id === 'scGateWrap') {
+        gateLoops++;
+        if (gateLoops > 6) {
+          throw new Error('Too many consecutive gate challenges - likely IP-flagged.');
+        }
         await solveGate(page, () => gateStart);
         await sleep(400); // server refetches the real challenge
         continue;
       }
+      gateLoops = 0;
 
       const data = await waitForChallenge(page, () => challenge);
       if (id === 'scSlideWrap') await solveSlide(page, data.target_pct);
@@ -290,12 +296,75 @@ async function solveCaptcha(page, options = {}) {
   }
   log('Captcha verified!');
 }
+// ---- Bot-check page: math question + SlideCaptcha + verify ----
+function evalMath(question) {
+  const m = String(question).replace(/,/g, '').match(/(-?\d+(?:\.\d+)?)\s*([+\-×x*/÷])\s*(-?\d+(?:\.\d+)?)/);
+  if (!m) return null;
+  const a = parseFloat(m[1]);
+  const b = parseFloat(m[3]);
+  switch (m[2]) {
+    case '+': return a + b;
+    case '-': return a - b;
+    case '×': case 'x': case '*': return a * b;
+    case '÷': case '/': return b !== 0 ? a / b : null;
+    default: return null;
+  }
+}
+
+async function solveBotCheck(page) {
+  log('On bot-check page - solving the security check...');
+  await page.waitForSelector('.botcheck-question', { timeout: 15000 });
+  await page.waitForSelector('#mathAnswer', { timeout: 15000 });
+
+  const question = (await page.locator('.botcheck-question').innerText()).trim();
+  const answer = evalMath(question);
+  if (answer === null) throw new Error('Could not parse bot-check math: ' + question);
+  log(`  math: ${question} -> ${answer}`);
+  await page.type('#mathAnswer', String(answer), { delay: 90 });
+
+  // Human-like pause before opening the captcha
+  await sleep(1500 + Math.random() * 2000);
+
+  const opened = await page.evaluate(() => {
+    const btn = document.getElementById('openCaptchaBtn');
+    if (!btn) return false;
+    btn.click();
+    return true;
+  });
+  if (!opened) throw new Error('Could not open the bot-check captcha');
+
+  await solveCaptcha(page, {
+    isVerified: async () => (await page.locator('#captchaStatus.passed').count()) > 0,
+  });
+
+  await sleep(1200 + Math.random() * 1500);
+
+  const submitted = await page.evaluate(() => {
+    const btn = document.getElementById('botCheckBtn');
+    if (!btn) return false;
+    btn.click();
+    return true;
+  });
+  if (!submitted) throw new Error('Could not submit the bot-check form');
+
+  await page.waitForURL((u) => !u.pathname.includes('/bot-check'), { timeout: 20000 });
+  log('Bot-check passed.');
+}
+
 // ---- Session / navigation helpers ----
 async function gotoFaucet(page) {
   await page.goto(CONFIG.site + '/faucet', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  // #claimCard can be delayed by an interstitial ad or slow render; retry while
-  // dismissing interstitials between attempts.
+  // #claimCard can be delayed by an interstitial ad, a slow render, or the
+  // site redirecting /faucet to its /bot-check security page. Handle all of
+  // them and retry while dismissing interstitials between attempts.
   for (let i = 0; i < 4; i++) {
+    if (page.url().includes('/bot-check')) {
+      try {
+        await solveBotCheck(page);
+      } catch (e) {
+        log(`  bot-check solve failed: ${e.message}`);
+      }
+    }
     try {
       await page.waitForSelector('#claimCard', { timeout: 10000 });
       return true; // logged in and on the faucet
@@ -514,12 +583,17 @@ async function claimFaucet(page) {
     }
 
     log('VPN/proxy detected - re-logging in to get a fresh session...');
-    await ensureLoggedIn(page);
-    if (!(await reachFaucet(page))) throw new Error('Could not reach faucet after re-login');
-    await dismissInterstitial(page);
-    const ready = await isFaucetReady(page);
-    if (!ready) {
-      log('Faucet on cooldown after re-login, skipping claim this round.');
+    try {
+      await ensureLoggedIn(page);
+      if (!(await reachFaucet(page))) throw new Error('Could not reach faucet after re-login');
+      await dismissInterstitial(page);
+      const ready = await isFaucetReady(page);
+      if (!ready) {
+        log('Faucet on cooldown after re-login, skipping claim this round.');
+        return;
+      }
+    } catch (e) {
+      log(`Re-login after VPN block failed: ${e.message} - skipping claim this round.`);
       return;
     }
   }
