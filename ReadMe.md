@@ -35,9 +35,11 @@ npx playwright install --with-deps chromium
 
 ## Usage
 
-Run locally:
+Run locally (credentials are read from the environment):
 
 ```bash
+export ARUBLE_EMAIL=you@example.com
+export ARUBLE_PASSWORD=yourpassword
 node login.js
 ```
 
@@ -45,8 +47,8 @@ node login.js
 
 | Variable           | Default      | Description                                                            |
 | ------------------ | ------------ | ---------------------------------------------------------------------- |
-| `ARUBLE_EMAIL`     | (in config)  | Account email. Overrides the value baked into `login.js`.              |
-| `ARUBLE_PASSWORD`  | (in config)  | Account password. Overrides the value baked into `login.js`.           |
+| `ARUBLE_EMAIL`     | **required** | Account email.                                                         |
+| `ARUBLE_PASSWORD`  | **required** | Account password.                                                      |
 | `PROXY_URL`        | none         | Proxy, e.g. `http://user:pass@host:port`. Needed if your IP is blocked by the site's VPN check. |
 | `CLAIM_WAIT_MIN`   | `360`        | Min wait (seconds) between claims (default 6 min).                     |
 | `CLAIM_WAIT_MAX`   | `420`        | Max wait (seconds) between claims (default 7 min).                     |
@@ -56,9 +58,11 @@ Examples:
 
 ```bash
 # limited test run with a short wait
+ARUBLE_EMAIL=you@example.com ARUBLE_PASSWORD=yourpassword \
 MAX_ROUNDS=2 CLAIM_WAIT_MIN=10 CLAIM_WAIT_MAX=15 node login.js
 
 # with a residential proxy
+ARUBLE_EMAIL=you@example.com ARUBLE_PASSWORD=yourpassword \
 PROXY_URL=http://user:pass@host:port node login.js
 ```
 
@@ -82,9 +86,9 @@ GitHub runner.
 3. Run the workflow manually from the **Actions** tab, or it will run on the
    configured schedule.
 
-> Security note: `login.js` currently contains the account email/password as
-> fallback values. For a public repository, remove those defaults and rely on
-> the `ARUBLE_EMAIL` / `ARUBLE_PASSWORD` secrets (and rotate the password).
+> Security note: credentials are **not** stored in the repository. They must be
+> supplied through the `ARUBLE_EMAIL` / `ARUBLE_PASSWORD` environment variables
+> (locally) or through the matching Actions secrets.
 
 ## Project layout
 

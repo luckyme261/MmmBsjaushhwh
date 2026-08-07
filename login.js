@@ -5,10 +5,9 @@ const STORAGE_STATE = 'session.json';
 
 const CONFIG = {
   site: 'https://aruble.net',
-  // Credentials can come from env vars (ARUBLE_EMAIL / ARUBLE_PASSWORD),
-  // falling back to the values baked into the config below.
-  email: process.env.ARUBLE_EMAIL || 'francisdominic261@gmail.com',
-  password: process.env.ARUBLE_PASSWORD || 'Frank986532',
+  // Credentials must be provided via env vars (ARUBLE_EMAIL / ARUBLE_PASSWORD).
+  email: process.env.ARUBLE_EMAIL || '',
+  password: process.env.ARUBLE_PASSWORD || '',
   headless: true,
   // Random wait between claims (seconds). 6-7 minutes by default.
   // Override with CLAIM_WAIT_MIN / CLAIM_WAIT_MAX env vars.
@@ -332,6 +331,9 @@ async function ensureLoggedIn(page) {
 }
 
 async function run() {
+  if (!CONFIG.email || !CONFIG.password) {
+    throw new Error('ARUBLE_EMAIL / ARUBLE_PASSWORD environment variables are not set.');
+  }
   const browser = await chromium.launch({
     headless: CONFIG.headless,
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
