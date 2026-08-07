@@ -20,6 +20,9 @@ in a loop with a random 6-7 minute wait between claims.
 - **Session persistence** - the login cookie storage is saved to `session.json`
   and restored on the next run.
 - **Loop mode** - claims continuously with a random 6-7 minute delay between rounds.
+- **Auto re-login on VPN/proxy block** - if `/faucet/claim` responds with
+  `VPN or proxy detected`, the bot re-logs in (fresh session) and retries the
+  claim up to 3 times before giving up that round.
 - **Proxy support** - required if the network IP is flagged as VPN/datacenter,
   because the claim endpoint rejects those IPs.
 

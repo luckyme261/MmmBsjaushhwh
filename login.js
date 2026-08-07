@@ -293,20 +293,41 @@ async function solveCaptcha(page, options = {}) {
 // ---- Session / navigation helpers ----
 async function gotoFaucet(page) {
   await page.goto(CONFIG.site + '/faucet', { waitUntil: 'domcontentloaded', timeout: 60000 });
-  try {
-    await page.waitForSelector('#claimCard', { timeout: 20000 });
-    return true; // logged in and on the faucet
-  } catch (e) {
-    return false; // likely logged out or session expired
+  // #claimCard can be delayed by an interstitial ad or slow render; retry while
+  // dismissing interstitials between attempts.
+  for (let i = 0; i < 4; i++) {
+    try {
+      await page.waitForSelector('#claimCard', { timeout: 10000 });
+      return true; // logged in and on the faucet
+    } catch (e) {
+      await dismissInterstitial(page);
+    }
   }
+  return false; // likely logged out or session expired
+}
+
+async function reachFaucet(page, maxAttempts = 3) {
+  for (let i = 0; i < maxAttempts; i++) {
+    if (await gotoFaucet(page)) return true;
+    await sleep(5000);
+  }
+  return false;
 }
 
 async function dismissInterstitial(page) {
-  try {
-    await page.waitForSelector('#interstitialSkip:not([disabled])', { timeout: 8000 });
-    await page.click('#interstitialSkip');
-    log('Closed interstitial ad');
-  } catch (e) { /* no interstitial */ }
+  for (let i = 0; i < 3; i++) {
+    try {
+      await page.waitForSelector('#interstitialSkip:not([disabled])', { timeout: 15000 });
+      await page.click('#interstitialSkip');
+      log('Closed interstitial ad');
+    } catch (e) { /* no interstitial */ return; }
+    // The bot-check interstitial redirects to its return_to URL after skipping;
+    // give the redirect a moment and stop once we're past it.
+    try {
+      await page.waitForURL((u) => !u.pathname.includes('/bot-check'), { timeout: 10000 });
+      return;
+    } catch (e) { /* still on bot-check - the IP may be flagged; retry */ }
+  }
   await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
 }
 
@@ -318,6 +339,12 @@ async function isFaucetReady(page) {
 
 async function ensureLoggedIn(page) {
   log('Session expired - logging in...');
+  // Drop the session cookies so the homepage shows the login button even when
+  // the current session is still valid server-side (e.g. the claim endpoint
+  // blocked it as VPN/proxy but auth still works). A fresh login then gets a
+  // brand-new session. (The /logout endpoint is avoided: it routes through a
+  // bot-check interstitial.)
+  await page.context().clearCookies().catch(() => {});
   await page.goto(CONFIG.site, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
   // Wait for the page to settle (also covers Cloudflare interstitials)
@@ -378,7 +405,7 @@ async function run() {
       if (!onFaucet) {
         await ensureLoggedIn(page);
         await saveSession();
-        onFaucet = await gotoFaucet(page);
+        onFaucet = await reachFaucet(page);
         if (!onFaucet) throw new Error('Could not reach faucet after login');
       }
       await dismissInterstitial(page);
@@ -413,15 +440,7 @@ async function run() {
 }
 
 // ---- Faucet claim ----
-async function claimFaucet(page) {
-  const btnText = await page.locator('#claimBtnText').innerText().catch(() => '');
-  const disabled = await page.locator('#claimBtn').isDisabled().catch(() => true);
-  if (disabled || !/claim now/i.test(btnText)) {
-    log(`Faucet on cooldown (button: "${btnText}"), skipping claim.`);
-    return;
-  }
-
-  log('Claiming faucet reward...');
+async function attemptClaim(page) {
   let claimResult = null;
   const onResp = async (resp) => {
     try {
@@ -431,25 +450,62 @@ async function claimFaucet(page) {
     } catch (e) { /* ignore */ }
   };
   page.on('response', onResp);
-
   try {
     await solveCaptcha(page, {
       openBy: 'openCaptchaForClaim()',
       isVerified: async () => claimResult !== null,
     });
-
-    // Wait for the claim POST to settle (success or cooldown error)
+    // Wait for the claim POST to settle (success or cooldown/VPN error)
     for (let i = 0; i < 50; i++) {
       if (claimResult) break;
       await sleep(400);
     }
-    if (claimResult && claimResult.success) {
-      log(`Claim SUCCESS: +${claimResult.amount} ${claimResult.symbol} -> balance ${claimResult.balance_after}`);
-    } else {
-      log(`Claim failed: ${(claimResult && claimResult.message) || 'no server response'}`);
-    }
   } finally {
     page.off('response', onResp);
+  }
+  return claimResult;
+}
+
+async function claimFaucet(page) {
+  const btnText = await page.locator('#claimBtnText').innerText().catch(() => '');
+  const disabled = await page.locator('#claimBtn').isDisabled().catch(() => true);
+  if (disabled || !/claim now/i.test(btnText)) {
+    log(`Faucet on cooldown (button: "${btnText}"), skipping claim.`);
+    return;
+  }
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    log(`Claiming faucet reward (attempt ${attempt}/3)...`);
+    const result = await attemptClaim(page);
+
+    if (result && result.success) {
+      log(`Claim SUCCESS: +${result.amount} ${result.symbol} -> balance ${result.balance_after}`);
+      return;
+    }
+
+    const msg = (result && result.message) || 'no server response';
+    log(`Claim attempt ${attempt} failed: ${msg}`);
+
+    // The site's fraud check rejects sessions whose IP looks like a VPN/proxy.
+    // Re-logging in gets a fresh session, which sometimes clears the flag.
+    if (!/vpn|proxy|detected/i.test(msg)) {
+      log('Non-retryable claim error, giving up this round.');
+      return;
+    }
+    if (attempt === 3) {
+      log('Still VPN/proxy blocked after 3 attempts - giving up this round.');
+      return;
+    }
+
+    log('VPN/proxy detected - re-logging in to get a fresh session...');
+    await ensureLoggedIn(page);
+    if (!(await reachFaucet(page))) throw new Error('Could not reach faucet after re-login');
+    await dismissInterstitial(page);
+    const ready = await isFaucetReady(page);
+    if (!ready) {
+      log('Faucet on cooldown after re-login, skipping claim this round.');
+      return;
+    }
   }
 }
 
