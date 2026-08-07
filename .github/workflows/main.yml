@@ -2,6 +2,19 @@ name: Aruble Faucet Bot
 
 on:
   workflow_dispatch:
+    inputs:
+      max_rounds:
+        description: 'Claim rounds to run (0 = run until job timeout)'
+        required: false
+        default: '40'
+      claim_wait_min:
+        description: 'Min wait (seconds) between claims'
+        required: false
+        default: '360'
+      claim_wait_max:
+        description: 'Max wait (seconds) between claims'
+        required: false
+        default: '420'
   push:
     branches: [main]
   schedule:
@@ -17,8 +30,9 @@ jobs:
       ARUBLE_EMAIL: ${{ secrets.ARUBLE_EMAIL }}
       ARUBLE_PASSWORD: ${{ secrets.ARUBLE_PASSWORD }}
       PROXY_URL: ${{ secrets.PROXY_URL }}
-      # 40 rounds x ~6.5 min ~= 260 min, finishing before the job timeout.
-      MAX_ROUNDS: '40'
+      MAX_ROUNDS: ${{ inputs.max_rounds || '40' }}
+      CLAIM_WAIT_MIN: ${{ inputs.claim_wait_min || '360' }}
+      CLAIM_WAIT_MAX: ${{ inputs.claim_wait_max || '420' }}
 
     steps:
       - name: Checkout
