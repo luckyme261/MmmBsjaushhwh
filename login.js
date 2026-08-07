@@ -470,10 +470,7 @@ async function ensureLoggedIn(page) {
   log('Logged in.');
 }
 
-async function run() {
-  if (!CONFIG.email || !CONFIG.password) {
-    throw new Error('ARUBLE_EMAIL / ARUBLE_PASSWORD environment variables are not set.');
-  }
+async function startBrowser() {
   const browser = await chromium.launch({
     headless: CONFIG.headless,
     args: ['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage'],
@@ -496,13 +493,23 @@ async function run() {
     Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
   });
   const page = await context.newPage();
+  return { browser, context, page, saveSession };
+}
 
-  try {
-    let round = 0;
-    while (round < CONFIG.maxRounds) {
-      round++;
-      log(`--- Round ${round} ---`);
-
+async function run() {
+  if (!CONFIG.email || !CONFIG.password) {
+    throw new Error('ARUBLE_EMAIL / ARUBLE_PASSWORD environment variables are not set.');
+  }
+  // A fresh browser each round forces new proxy connections, so the rotating
+  // residential proxy hands out a fresh exit IP per round. The site flags an
+  // IP after ~1 claim, so rotating per round is what keeps claims working.
+  let consecutiveFailures = 0;
+  let round = 0;
+  while (round < CONFIG.maxRounds) {
+    round++;
+    log(`--- Round ${round} ---`);
+    const { browser, page, saveSession } = await startBrowser();
+    try {
       // 1. Reach the faucet, reusing the existing session when possible.
       let onFaucet = await gotoFaucet(page);
       if (!onFaucet) {
@@ -524,22 +531,28 @@ async function run() {
       } else {
         log(`Faucet on cooldown (timer=${timer}), skipping claim this round.`);
       }
-
-      if (round >= CONFIG.maxRounds) break;
-
-      // 3. Wait a random 6-7 minutes before the next claim
-      const waitSec = CONFIG.claimWaitMin + Math.floor(Math.random() * (CONFIG.claimWaitMax - CONFIG.claimWaitMin + 1));
-      log(`Waiting ${waitSec}s (${(waitSec / 60).toFixed(2)} min) before next claim...`);
-      await sleep(waitSec * 1000);
+      await saveSession();
+      consecutiveFailures = 0;
+    } catch (err) {
+      log(`Round ${round} error: ${err.message}`);
+      await page.screenshot({ path: `error_round${round}.png`, fullPage: true }).catch(() => {});
+      consecutiveFailures++;
+      if (consecutiveFailures >= 6) {
+        log('6 consecutive failed rounds - aborting.');
+        throw new Error('Aborting after 6 consecutive failed rounds');
+      }
+    } finally {
+      await browser.close();
     }
-    log('Bot finished.');
-  } catch (err) {
-    log('ERROR: ' + err.message);
-    await page.screenshot({ path: 'error.png', fullPage: true }).catch(() => {});
-    process.exitCode = 1;
-  } finally {
-    await browser.close();
+
+    if (round >= CONFIG.maxRounds) break;
+
+    // 3. Wait a random 6-7 minutes before the next claim
+    const waitSec = CONFIG.claimWaitMin + Math.floor(Math.random() * (CONFIG.claimWaitMax - CONFIG.claimWaitMin + 1));
+    log(`Waiting ${waitSec}s (${(waitSec / 60).toFixed(2)} min) before next claim...`);
+    await sleep(waitSec * 1000);
   }
+  log('Bot finished.');
 }
 
 // ---- Faucet claim ----
@@ -579,7 +592,14 @@ async function claimFaucet(page) {
 
   for (let attempt = 1; attempt <= 3; attempt++) {
     log(`Claiming faucet reward (attempt ${attempt}/3)...`);
-    const result = await attemptClaim(page);
+    let result;
+    try {
+      result = await attemptClaim(page);
+    } catch (e) {
+      // Flagged IPs gate-loop in the captcha; the next round gets a fresh IP.
+      log(`Claim captcha failed (${e.message}) - skipping claim this round.`);
+      return;
+    }
 
     if (result && result.success) {
       log(`Claim SUCCESS: +${result.amount} ${result.symbol} -> balance ${result.balance_after}`);
