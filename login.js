@@ -13,12 +13,26 @@ const CONFIG = {
   // Override with CLAIM_WAIT_MIN / CLAIM_WAIT_MAX env vars.
   claimWaitMin: parseInt(process.env.CLAIM_WAIT_MIN || '360', 10),
   claimWaitMax: parseInt(process.env.CLAIM_WAIT_MAX || '420', 10),
-  // Optional residential proxy, e.g. PROXY_URL=http://user:pass@host:port
+  // Optional residential proxy, e.g. PROXY_URL=socks5://user:pass@host:port
   // Needed because the claim endpoint rejects datacenter/VPN IPs.
-  proxy: process.env.PROXY_URL || null,
+  proxyUrl: process.env.PROXY_URL || null,
+  proxy: null,
+  proxyUser: null,
+  proxyPass: null,
   // For testing; set MAX_ROUNDS=n env to limit loop iterations.
   maxRounds: parseInt(process.env.MAX_ROUNDS || '0', 10) || Infinity,
 };
+
+if (CONFIG.proxyUrl) {
+  try {
+    const u = new URL(CONFIG.proxyUrl);
+    CONFIG.proxy = `${u.protocol}//${u.host}`;
+    CONFIG.proxyUser = u.username ? decodeURIComponent(u.username) : null;
+    CONFIG.proxyPass = u.password ? decodeURIComponent(u.password) : null;
+  } catch (e) {
+    log(`WARN: could not parse PROXY_URL (${CONFIG.proxyUrl}): ${e.message}`);
+  }
+}
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -470,7 +484,11 @@ async function run() {
     locale: 'en-US',
     timezoneId: 'America/New_York',
   };
-  if (CONFIG.proxy) contextOptions.proxy = { server: CONFIG.proxy };
+  if (CONFIG.proxy) {
+    contextOptions.proxy = { server: CONFIG.proxy };
+    if (CONFIG.proxyUser) contextOptions.proxy.username = CONFIG.proxyUser;
+    if (CONFIG.proxyPass) contextOptions.proxy.password = CONFIG.proxyPass;
+  }
   if (fs.existsSync(STORAGE_STATE)) contextOptions.storageState = STORAGE_STATE;
   const context = await browser.newContext(contextOptions);
   const saveSession = () => context.storageState({ path: STORAGE_STATE }).catch(() => {});
